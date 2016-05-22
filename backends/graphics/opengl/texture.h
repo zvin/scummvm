@@ -84,8 +84,21 @@ public:
 	void flagDirty() { _allDirty = true; }
 	bool isDirty() const { return _allDirty || !_dirtyArea.isEmpty(); }
 
-	uint getWidth() const { return _userPixelData.w; }
-	uint getHeight() const { return _userPixelData.h; }
+	//-------------- xBRZ support --------------------
+	uint getWidth() const {
+		return getSurface()->w;
+	}
+	uint getHeight() const {
+		return getSurface()->h;
+	}
+
+	virtual bool xbrzScalingIsActive() const {
+		return false;
+	};
+	virtual int getXbrzScalingFactor() const {
+		return 0;
+	};
+	//-------------- /xBRZ support --------------------
 
 	/**
 	 * @return The hardware format of the texture data.
@@ -105,10 +118,7 @@ public:
 	 */
 	virtual bool hasPalette() const { return false; }
 
-	virtual void setPalette(uint start, uint colors, const byte *palData) {}
-
-	virtual void *getPalette() { return 0; }
-	virtual const void *getPalette() const { return 0; }
+	virtual void setPalette(uint start, uint colors, const byte *palData, int transparentColor) {}
 
 	/**
 	 * Query texture related OpenGL information from the context. This only
@@ -145,7 +155,8 @@ private:
 
 class TextureCLUT8 : public Texture {
 public:
-	TextureCLUT8(GLenum glIntFormat, GLenum glFormat, GLenum glType, const Graphics::PixelFormat &format);
+	TextureCLUT8(GLenum glIntFormat, GLenum glFormat, GLenum glType, const Graphics::PixelFormat &format, bool enableXbrzScaling);
+
 	virtual ~TextureCLUT8();
 
 	virtual void allocate(uint width, uint height);
@@ -154,18 +165,31 @@ public:
 
 	virtual bool hasPalette() const { return true; }
 
-	virtual void setPalette(uint start, uint colors, const byte *palData);
-
-	virtual void *getPalette() { return _palette; }
-	virtual const void *getPalette() const { return _palette; }
+	virtual void setPalette(uint start, uint colors, const byte *palData, int transparentColor /*[0, 255], -1 if none*/);
 
 	virtual Graphics::Surface *getSurface() { return &_clut8Data; }
 	virtual const Graphics::Surface *getSurface() const { return &_clut8Data; }
+
+	virtual bool xbrzScalingIsActive() const override {
+		return xbrzScalingActive;
+	};
+	virtual int getXbrzScalingFactor() const override {
+		assert(xbrzScaleFactor > 0);
+		return xbrzScaleFactor;
+	};
 
 protected:
 	virtual void updateTexture();
 
 private:
+	//-------------- xBRZ support --------------------
+	//compiler errors: std::vector obviously too "new" for ScummVM!
+	struct XbrzPimpl;
+	XbrzPimpl *xbrzPimpl;
+	const bool xbrzScalingActive;
+	int xbrzScaleFactor = -1; //later linear-scaled to fit screen with openGL
+	//-------------- /xBRZ support --------------------
+
 	Graphics::Surface _clut8Data;
 	byte *_palette;
 };

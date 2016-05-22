@@ -44,7 +44,8 @@ class Texture;
 
 enum {
 	GFX_LINEAR = 0,
-	GFX_NEAREST = 1
+	GFX_NEAREST = 1,
+	GFX_XBRZ = 2
 };
 
 class OpenGLGraphicsManager : virtual public GraphicsManager {
@@ -190,7 +191,7 @@ private:
 #ifdef USE_RGB_COLOR
 		    gameFormat(),
 #endif
-		    aspectRatioCorrection(false), graphicsMode(GFX_LINEAR) {
+		    aspectRatioCorrection(false), graphicsMode(GFX_XBRZ) {
 		}
 
 		bool valid;

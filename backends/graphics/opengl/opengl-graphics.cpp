@@ -117,6 +117,7 @@ namespace {
 const OSystem::GraphicsMode glGraphicsModes[] = {
 	{ "opengl_linear",  _s("OpenGL"),                GFX_LINEAR  },
 	{ "opengl_nearest", _s("OpenGL (No filtering)"), GFX_NEAREST },
+	{ "opengl_xbrz",    _s("OpenGL + xBRZ scaler"),  GFX_XBRZ },
 	{ nullptr, nullptr, 0 }
 };
 
@@ -127,7 +128,7 @@ const OSystem::GraphicsMode *OpenGLGraphicsManager::getSupportedGraphicsModes() 
 }
 
 int OpenGLGraphicsManager::getDefaultGraphicsMode() const {
-	return GFX_LINEAR;
+	return GFX_XBRZ;
 }
 
 bool OpenGLGraphicsManager::setGraphicsMode(int mode) {
@@ -136,16 +137,14 @@ bool OpenGLGraphicsManager::setGraphicsMode(int mode) {
 	switch (mode) {
 	case GFX_LINEAR:
 	case GFX_NEAREST:
+	case GFX_XBRZ:
 		_currentState.graphicsMode = mode;
-
 		if (_gameScreen) {
-			_gameScreen->enableLinearFiltering(mode == GFX_LINEAR);
+			_gameScreen->enableLinearFiltering(mode == GFX_LINEAR || mode == GFX_XBRZ);
 		}
-
 		if (_cursor) {
-			_cursor->enableLinearFiltering(mode == GFX_LINEAR);
+			_cursor->enableLinearFiltering(mode == GFX_LINEAR || mode == GFX_XBRZ);
 		}
-
 		return true;
 
 	default:
@@ -272,11 +271,11 @@ OSystem::TransactionError OpenGLGraphicsManager::endGFXTransaction() {
 #endif
 		assert(_gameScreen);
 		if (_gameScreen->hasPalette()) {
-			_gameScreen->setPalette(0, 256, _gamePalette);
+			_gameScreen->setPalette(0, 256, _gamePalette, -1);
 		}
 
 		_gameScreen->allocate(_currentState.gameWidth, _currentState.gameHeight);
-		_gameScreen->enableLinearFiltering(_currentState.graphicsMode == GFX_LINEAR);
+		_gameScreen->enableLinearFiltering(_currentState.graphicsMode == GFX_LINEAR || _currentState.graphicsMode == GFX_XBRZ);
 		// We fill the screen to all black or index 0 for CLUT8.
 #ifdef USE_RGB_COLOR
 		if (_currentState.gameFormat.bytesPerPixel == 1) {
@@ -489,7 +488,6 @@ void OpenGLGraphicsManager::warpMouse(int x, int y) {
 		if (!_overlay) {
 			return;
 		}
-	
 		// It might be confusing that we actually have to handle something
 		// here when the overlay is visible. This is because for very small
 		// resolutions we have a minimal overlay size and have to adjust
@@ -564,7 +562,7 @@ void OpenGLGraphicsManager::setMouseCursor(const void *buf, uint w, uint h, int 
 		}
 		_cursor = createTexture(textureFormat, true);
 		assert(_cursor);
-		_cursor->enableLinearFiltering(_currentState.graphicsMode == GFX_LINEAR);
+		_cursor->enableLinearFiltering(_currentState.graphicsMode == GFX_LINEAR || _currentState.graphicsMode == GFX_XBRZ);
 	}
 
 	_cursorKeyColor = keycolor;
@@ -692,7 +690,7 @@ void OpenGLGraphicsManager::setPalette(const byte *colors, uint start, uint num)
 	assert(_gameScreen->hasPalette());
 
 	memcpy(_gamePalette + start * 3, colors, num * 3);
-	_gameScreen->setPalette(start, num, colors);
+	_gameScreen->setPalette(start, num, colors, -1);
 
 	// We might need to update the cursor palette here.
 	updateCursorPalette();
@@ -909,7 +907,7 @@ Texture *OpenGLGraphicsManager::createTexture(const Graphics::PixelFormat &forma
 		if (!supported) {
 			return nullptr;
 		} else {
-			return new TextureCLUT8(glIntFormat, glFormat, glType, virtFormat);
+			return new TextureCLUT8(glIntFormat, glFormat, glType, virtFormat, _currentState.graphicsMode == GFX_XBRZ);
 		}
 	} else {
 		const bool supported = getGLPixelFormat(format, glIntFormat, glFormat, glType);
@@ -1054,24 +1052,9 @@ void OpenGLGraphicsManager::updateCursorPalette() {
 	}
 
 	if (_cursorPaletteEnabled) {
-		_cursor->setPalette(0, 256, _cursorPalette);
+		_cursor->setPalette(0, 256, _cursorPalette, _cursorKeyColor);
 	} else {
-		_cursor->setPalette(0, 256, _gamePalette);
-	}
-
-	// We remove all alpha bits from the palette entry of the color key.
-	// This makes sure its properly handled as color key.
-	const Graphics::PixelFormat &hardwareFormat = _cursor->getHardwareFormat();
-	const uint32 aMask = (0xFF >> hardwareFormat.aLoss) << hardwareFormat.aShift;
-
-	if (hardwareFormat.bytesPerPixel == 2) {
-		uint16 *palette = (uint16 *)_cursor->getPalette() + _cursorKeyColor;
-		*palette &= ~aMask;
-	} else if (hardwareFormat.bytesPerPixel == 4) {
-		uint32 *palette = (uint32 *)_cursor->getPalette() + _cursorKeyColor;
-		*palette &= ~aMask;
-	} else {
-		warning("OpenGLGraphicsManager::updateCursorPalette: Unsupported pixel depth %d", hardwareFormat.bytesPerPixel);
+		_cursor->setPalette(0, 256, _gamePalette, _cursorKeyColor);
 	}
 }
 

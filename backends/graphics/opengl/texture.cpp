@@ -20,6 +20,17 @@
  *
  */
 
+//-------------- xBRZ support --------------------
+#include <vector>
+#include <algorithm>
+#if defined(_OPENMP)
+    #include <omp.h>
+#endif
+#include "graphics/scaler/xbrz.h"
+
+const int TASK_GRANULARITY = 16; //granularity 1 has noticeable overhead for xBRZ
+//-------------- /xBRZ support --------------------
+
 #include "backends/graphics/opengl/texture.h"
 #include "backends/graphics/opengl/extensions.h"
 #include "backends/graphics/opengl/debug.h"
@@ -208,6 +219,20 @@ void Texture::updateTexture() {
 	}
 
 	Common::Rect dirtyArea = getDirtyArea();
+	//-------------- xBRZ support --------------------
+	if (xbrzScalingIsActive()) {
+		const int xbrzScaleFactor = getXbrzScalingFactor();
+		assert(xbrzScaleFactor > 0);
+
+		//enlarge dirty rect by two more rows/columns of pixels (see xbrz.h)
+		dirtyArea.top   = std::max(0, dirtyArea.top  - 2);
+		dirtyArea.left   = std::max(0, dirtyArea.left - 2);
+		dirtyArea.bottom = std::min(getSurface()->h, (uint16)(dirtyArea.bottom + 2)); //compare against "_clut8Data"
+		dirtyArea.right  = std::min(getSurface()->w, (uint16)(dirtyArea.right  + 2));
+
+		dirtyArea = Common::Rect(dirtyArea.left * xbrzScaleFactor, dirtyArea.top * xbrzScaleFactor, dirtyArea.right * xbrzScaleFactor, dirtyArea.bottom * xbrzScaleFactor);
+	}
+	//-------------- /xBRZ support --------------------
 
 	// In case we use linear filtering we might need to duplicate the last
 	// pixel row/column to avoid glitches with filtering.
@@ -268,25 +293,58 @@ void Texture::updateTexture() {
 
 Common::Rect Texture::getDirtyArea() const {
 	if (_allDirty) {
-		return Common::Rect(_userPixelData.w, _userPixelData.h);
+		//-------------- xBRZ support --------------------
+		const Graphics::Surface *dstSurf = getSurface();
+		return Common::Rect(dstSurf->w, dstSurf->h);
+		//-------------- /xBRZ support --------------------
 	} else {
 		return _dirtyArea;
 	}
 }
 
-TextureCLUT8::TextureCLUT8(GLenum glIntFormat, GLenum glFormat, GLenum glType, const Graphics::PixelFormat &format)
-    : Texture(glIntFormat, glFormat, glType, format), _clut8Data(), _palette(new byte[256 * format.bytesPerPixel]) {
+
+//-------------- xBRZ support --------------------
+struct TextureCLUT8::XbrzPimpl {
+	XbrzPimpl() : eightBitToRgb(256) {}
+
+	std::vector<uint32_t> eightBitToRgb; //map 8-bit color to ARGB as needed by xBRZ
+
+	std::vector<uint32_t> xbrzBufIn;  //unscaled ARGB image
+	std::vector<uint32_t> xbrzBufOut; //xBRZ-scaled ARGB image
+};
+//-------------- /xBRZ support --------------------
+
+
+TextureCLUT8::TextureCLUT8(GLenum glIntFormat, GLenum glFormat, GLenum glType, const Graphics::PixelFormat &format, bool enableXbrzScaling)
+	: Texture(glIntFormat, glFormat, glType, format), xbrzScalingActive(enableXbrzScaling), _clut8Data(), _palette(new byte[256 * format.bytesPerPixel]) {
 	memset(_palette, 0, sizeof(byte) * format.bytesPerPixel);
+
+	//-------------- xBRZ support --------------------
+	xbrzPimpl = new XbrzPimpl;
+	//-------------- /xBRZ support --------------------
 }
 
 TextureCLUT8::~TextureCLUT8() {
+	//-------------- xBRZ support --------------------
+	delete xbrzPimpl;
+	//-------------- /xBRZ support --------------------
+
 	delete[] _palette;
 	_palette = nullptr;
 	_clut8Data.free();
 }
 
 void TextureCLUT8::allocate(uint width, uint height) {
-	Texture::allocate(width, height);
+	//-------------- xBRZ support --------------------
+	if (xbrzScalingActive) {
+		//quick and dirty heuristic to get reasonable scaling factor:
+		const double sampleMonitorHeight = 1080; //"No one will need more than 1080 lines of vertical space for a monitor"
+		xbrzScaleFactor = std::min(6, std::max(2, static_cast<int>(round(sampleMonitorHeight / height))));
+
+		Texture::allocate(xbrzScaleFactor * width, xbrzScaleFactor * height);
+	} else
+		//-------------- /xBRZ support --------------------
+		Texture::allocate(width, height);
 
 	// We only need to reinitialize our CLUT8 surface when the output size
 	// changed.
@@ -311,15 +369,42 @@ inline void convertPalette(ColorType *dst, const byte *src, uint colors, const G
 }
 } // End of anonymous namespace
 
-void TextureCLUT8::setPalette(uint start, uint colors, const byte *palData) {
+void TextureCLUT8::setPalette(uint start, uint colors, const byte *palData, int transparentColor) {
 	const Graphics::PixelFormat &hardwareFormat = getHardwareFormat();
 
-	if (hardwareFormat.bytesPerPixel == 2) {
-		convertPalette<uint16>((uint16 *)_palette + start, palData, colors, hardwareFormat);
-	} else if (hardwareFormat.bytesPerPixel == 4) {
-		convertPalette<uint32>((uint32 *)_palette + start, palData, colors, hardwareFormat);
-	} else {
-		warning("TextureCLUT8::setPalette: Unsupported pixel depth: %d", hardwareFormat.bytesPerPixel);
+	//-------------- xBRZ support --------------------
+	if (xbrzScalingActive) {
+		auto rgbTrg = reinterpret_cast<unsigned char *>(&xbrzPimpl->eightBitToRgb[start]);
+		const unsigned char *palSrc = palData;
+		for (int i = 0; i < static_cast<int>(colors); ++i) {
+			const unsigned char r = *palSrc++;
+			const unsigned char g = *palSrc++;
+			const unsigned char b = *palSrc++;
+			*rgbTrg++ = b; //compatible byte order for xBRZ
+			*rgbTrg++ = g;
+			*rgbTrg++ = r;
+			*rgbTrg++ = 255; //alpha
+		}
+
+		if (0 <= transparentColor && transparentColor < 256)
+			xbrzPimpl->eightBitToRgb[transparentColor] &= 0x00ffffff;
+	} else
+		//-------------- /xBRZ support --------------------
+	{
+		const uint32 aMask = (0xFF >> hardwareFormat.aLoss) << hardwareFormat.aShift;
+		if (hardwareFormat.bytesPerPixel == 2) {
+			convertPalette<uint16>((uint16 *)_palette + start, palData, colors, hardwareFormat);
+
+			if (0 <= transparentColor && transparentColor < 256)
+				*((uint16 *)_palette + transparentColor) &= ~aMask;
+		} else if (hardwareFormat.bytesPerPixel == 4) {
+			convertPalette<uint32>((uint32 *)_palette + start, palData, colors, hardwareFormat);
+
+			if (0 <= transparentColor && transparentColor < 256)
+				*((uint32 *)_palette + transparentColor) &= ~aMask;
+		} else {
+			warning("TextureCLUT8::setPalette: Unsupported pixel depth: %d", hardwareFormat.bytesPerPixel);
+		}
 	}
 
 	// A palette changes means we need to refresh the whole surface.
@@ -341,7 +426,37 @@ inline void doPaletteLookUp(PixelType *dst, const byte *src, uint width, uint he
 		src += srcAdd;
 	}
 }
-} // End of anonymous namespace
+
+//-------------- xBRZ support --------------------
+template<typename PixelType>
+void copyDirtyArea(const uint32_t *src, int srcPitch, PixelType *trg, int trgPitch, const Common::Rect &dirtyArea, const Graphics::PixelFormat &targetFormat) {
+	assert(sizeof(PixelType) ==  targetFormat.bytesPerPixel);
+
+	#pragma omp parallel for
+	for (int i = 0; i < dirtyArea.height(); i += TASK_GRANULARITY) {
+		const int iLast = std::min(i + TASK_GRANULARITY, (int)(dirtyArea.height()));
+
+		auto srcLoc = reinterpret_cast<const uint32_t *>(reinterpret_cast<const char *>(src) + (dirtyArea.top + i) * srcPitch + dirtyArea.left * sizeof(uint32_t));
+		auto trgLoc = reinterpret_cast<  PixelType *>(reinterpret_cast<    char *>(trg) + (dirtyArea.top + i) * trgPitch + dirtyArea.left * sizeof(PixelType));
+
+		for (int y = i; y < iLast; ++y) {
+			for (int x = 0; x < dirtyArea.width(); ++x) {
+				auto colPtr = reinterpret_cast<const unsigned char *>(&srcLoc[x]);
+				const unsigned char b = colPtr[0];
+				const unsigned char g = colPtr[1];
+				const unsigned char r = colPtr[2];
+				const unsigned char a = colPtr[3];
+
+				trgLoc[x] = targetFormat.ARGBToColor(a, r, g, b);
+			}
+
+			srcLoc = reinterpret_cast<const uint32_t *>(reinterpret_cast<const char *>(srcLoc) + srcPitch);
+			trgLoc = reinterpret_cast<   PixelType *>(reinterpret_cast<    char *>(trgLoc) + trgPitch);
+		}
+	}
+}
+//-------------- /xBRZ support --------------------
+}
 
 void TextureCLUT8::updateTexture() {
 	if (!isDirty()) {
@@ -353,18 +468,74 @@ void TextureCLUT8::updateTexture() {
 
 	Common::Rect dirtyArea = getDirtyArea();
 
-	if (outSurf->format.bytesPerPixel == 2) {
-		doPaletteLookUp<uint16>((uint16 *)outSurf->getBasePtr(dirtyArea.left, dirtyArea.top),
-		                        (const byte *)_clut8Data.getBasePtr(dirtyArea.left, dirtyArea.top),
-		                        dirtyArea.width(), dirtyArea.height(),
-		                        outSurf->pitch, _clut8Data.pitch, (const uint16 *)_palette);
-	} else if (outSurf->format.bytesPerPixel == 4) {
-		doPaletteLookUp<uint32>((uint32 *)outSurf->getBasePtr(dirtyArea.left, dirtyArea.top),
-		                        (const byte *)_clut8Data.getBasePtr(dirtyArea.left, dirtyArea.top),
-		                        dirtyArea.width(), dirtyArea.height(),
-		                        outSurf->pitch, _clut8Data.pitch, (const uint32 *)_palette);
-	} else {
-		warning("TextureCLUT8::updateTexture: Unsupported pixel depth: %d", outSurf->format.bytesPerPixel);
+	//-------------- xBRZ support --------------------
+	if (xbrzScalingActive) {
+		assert(xbrzScaleFactor > 0);
+
+		if (xbrzPimpl->xbrzBufIn.size() != static_cast<size_t>(_clut8Data.w * _clut8Data.h))
+			xbrzPimpl->xbrzBufIn.resize(_clut8Data.w * _clut8Data.h);
+
+		//copy dirty area from _clut8Data to xbrzBufIn
+		auto raw8bitIn = static_cast<const unsigned char *>(_clut8Data.getBasePtr(dirtyArea.left, dirtyArea.top));
+		auto xbrzBufIn = &xbrzPimpl->xbrzBufIn[dirtyArea.top * _clut8Data.w + dirtyArea.left];
+		const auto &eightBitToRgb = xbrzPimpl->eightBitToRgb;
+
+		for (int y = 0; y < dirtyArea.height(); ++y) {
+			for (int x = 0; x < dirtyArea.width(); ++x)
+				xbrzBufIn[x] = eightBitToRgb[raw8bitIn[x]];
+
+			raw8bitIn += _clut8Data.pitch;
+			xbrzBufIn += _clut8Data.w;
+		}
+
+		//xBRZ-scale dirty area from xbrzBufIn to xbrzBufOut
+		const int xbrzOutWidth  = _clut8Data.w * xbrzScaleFactor;
+		const int xbrzOutHeight = _clut8Data.h * xbrzScaleFactor;
+
+		if (xbrzPimpl->xbrzBufOut.size() != static_cast<size_t>(xbrzOutWidth * xbrzOutHeight))
+			xbrzPimpl->xbrzBufOut.resize(xbrzOutWidth * xbrzOutHeight);
+
+		//enlarge dirty rect by two more rows/columns of pixels (see xbrz.h)
+		dirtyArea.top   = std::max(0, dirtyArea.top  - 2);
+		dirtyArea.left   = std::max(0, dirtyArea.left - 2);
+		dirtyArea.bottom = std::min((int)(_clut8Data.h), dirtyArea.bottom + 2);
+		dirtyArea.right  = std::min((int)(_clut8Data.w), dirtyArea.right  + 2);
+
+		{
+			#pragma omp parallel for
+			for (int i = dirtyArea.top; i < dirtyArea.bottom; i += TASK_GRANULARITY) {
+				const int iLast = std::min(i + TASK_GRANULARITY, (int)(dirtyArea.bottom));
+				xbrz::scale(xbrzScaleFactor, &xbrzPimpl->xbrzBufIn[0], &xbrzPimpl->xbrzBufOut[0], _clut8Data.w, _clut8Data.h, xbrz::ColorFormat::ARGB, xbrz::ScalerCfg(), i, iLast);
+
+			}
+		}
+
+		//copy dirty area from xbrzBufOut to _userPixelData
+		const Common::Rect dirtyAreaScaled(dirtyArea.left * xbrzScaleFactor, dirtyArea.top * xbrzScaleFactor, dirtyArea.right * xbrzScaleFactor, dirtyArea.bottom * xbrzScaleFactor);
+		const Graphics::PixelFormat &hardwareFormat = getHardwareFormat();
+
+		if (hardwareFormat.bytesPerPixel == 2)
+			copyDirtyArea(&xbrzPimpl->xbrzBufOut[0], xbrzOutWidth * sizeof(uint32_t), static_cast<uint16 *>(outSurf->getPixels()), outSurf->pitch, dirtyAreaScaled, hardwareFormat);
+		else if (hardwareFormat.bytesPerPixel == 4)
+			copyDirtyArea(&xbrzPimpl->xbrzBufOut[0], xbrzOutWidth * sizeof(uint32_t), static_cast<uint32 *>(outSurf->getPixels()), outSurf->pitch, dirtyAreaScaled, hardwareFormat);
+		else
+			warning("xBZR: TextureCLUT8::updateTexture: Unsupported pixel depth: %d", outSurf->format.bytesPerPixel);
+	} else
+		//-------------- /xBRZ support --------------------
+	{
+		if (outSurf->format.bytesPerPixel == 2) {
+			doPaletteLookUp<uint16>((uint16 *)outSurf->getBasePtr(dirtyArea.left, dirtyArea.top),
+			                        (const byte *)_clut8Data.getBasePtr(dirtyArea.left, dirtyArea.top),
+			                        dirtyArea.width(), dirtyArea.height(),
+			                        outSurf->pitch, _clut8Data.pitch, (const uint16 *)_palette);
+		} else if (outSurf->format.bytesPerPixel == 4) {
+			doPaletteLookUp<uint32>((uint32 *)outSurf->getBasePtr(dirtyArea.left, dirtyArea.top),
+			                        (const byte *)_clut8Data.getBasePtr(dirtyArea.left, dirtyArea.top),
+			                        dirtyArea.width(), dirtyArea.height(),
+			                        outSurf->pitch, _clut8Data.pitch, (const uint32 *)_palette);
+		} else {
+			warning("TextureCLUT8::updateTexture: Unsupported pixel depth: %d", outSurf->format.bytesPerPixel);
+		}
 	}
 
 	// Do generic handling of updating the texture.

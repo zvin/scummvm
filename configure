@@ -893,6 +893,7 @@ Optional Features:
   --enable-c++11           build as C++11 if the compiler allows that
   --disable-debug          disable building with debugging symbols
   --enable-Werror          treat warnings as errors
+  --enable-openmp          enable OpenMP
   --enable-release         enable building in release mode (this activates
                            optimizations)
   --enable-release-mode    enable building in release mode (without optimizations)
@@ -1171,6 +1172,10 @@ for ac_option in $@; do
 		;;
 	--enable-Werror)
 		CXXFLAGS="$CXXFLAGS -Werror"
+		;;
+	--enable-openmp)
+		CXXFLAGS="$CXXFLAGS -fopenmp"
+		LDFLAGS="$LDFLAGS -fopenmp"
 		;;
 	--enable-release-mode)
 		_release_build=yes
